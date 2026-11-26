@@ -1,0 +1,30 @@
+{
+  "show": {
+    "audio": [
+      {"audio_id": "ridge", "name": "触摸山脊", "length_ticks": 2},
+      {"audio_id": "relief", "name": "山脊与河谷", "length_ticks": 4},
+      {"audio_id": "ore", "name": "矿石切面", "length_ticks": 1}
+    ],
+    "groups": [
+      {
+        "group_id": "atlas", "boards": ["L", "R"],
+        "rules": [
+          {"rule_id": "ridge-alone", "priority": 20, "requires": ["L"], "audio_id": "ridge"},
+          {"rule_id": "two-boards", "priority": 10, "requires": ["L", "R"], "audio_id": "relief"}
+        ]
+      },
+      {
+        "group_id": "minerals", "boards": ["M", "N"],
+        "rules": [
+          {"rule_id": "ore-face", "priority": 10, "requires": ["M"], "audio_id": "ore"}
+        ]
+      }
+    ]
+  },
+  "bindings": [
+    {"board_id": "L", "group_id": "atlas", "position": "atlas-west"},
+    {"board_id": "R", "group_id": "atlas", "position": "atlas-east"},
+    {"board_id": "M", "group_id": "minerals", "position": "minerals-west"},
+    {"board_id": "N", "group_id": "minerals", "position": "minerals-east"}
+  ]
+}

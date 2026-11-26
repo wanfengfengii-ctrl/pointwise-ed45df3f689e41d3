@@ -1,0 +1,21 @@
+__pycache__/
+*.sqlite3
+*.sqlite3-*
+*.sqlite3.panels
+*.sqlite3.panels-*
+
+# Pointwise local credentials and dependencies
+node_modules/
+.venv/
+venv/
+__pycache__/
+.pytest_cache/
+.DS_Store
+.env
+.env.local
+.env.*
+*.env
+credentials.json
+*token*.json
+*.pem
+*.key
