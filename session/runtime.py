@@ -8,14 +8,18 @@ from pathlib import Path
 from urllib.parse import parse_qsl, urlsplit
 
 from contract import ServiceError, fail, fields, integer, text
-from narration.decide import settle_group_tick
+from narration.correction import init_correction_schema, settle
 from narration.facts import init_narration_facts_schema
-from narration.intake import receive
+from narration.intake import receive, receive_authorized
 from narration.lookup import inspect
 from narration.playback import init_playback_schema, read_started_plays
 from panel.accept import touch
+from panel.correction import (
+    authorize, init_correction_schema as init_correctable_schema, propose, read_authorization,
+    retract,
+)
 from panel.delivery import init_delivery_schema, read_delivery
-from panel.evidence import decode_evidence
+from panel.evidence import AuthorizationEvidence, decode_evidence
 from panel.receipt import init_receipt_schema, lookup_receipt
 from panel.seal import seal
 from panel.ticks import init_panel_schema
@@ -25,7 +29,7 @@ from review.publish import init_review_schema
 from session.clock import open_tick
 from session.closing import close_session
 from session.opening import init_session_schema, open_session, read_session
-from session.scope import GroupTick, resolve_board_tick
+from session.scope import GroupTick, resolve_board_tick, resolve_group_tick
 
 
 @dataclass(frozen=True)
@@ -35,12 +39,15 @@ class Stores:
 
 
 _VENUE_SCHEMA = (init_program_schema, init_session_schema, init_narration_facts_schema,
-                 init_playback_schema, init_review_schema)
-_PANEL_SCHEMA = (init_delivery_schema, init_panel_schema, init_receipt_schema)
+                 init_correction_schema, init_playback_schema, init_review_schema)
+_PANEL_SCHEMA = (init_delivery_schema, init_panel_schema, init_receipt_schema,
+                 init_correctable_schema)
 _MAX_BODY = 1_048_576
-_POST = frozenset(('issue', 'open', 'tick', 'touch', 'seal', 'receive', 'close', 'report'))
+_POST = frozenset(('issue', 'open', 'tick', 'touch', 'seal', 'receive', 'close', 'report',
+                   'retract', 'propose', 'authorize'))
 _GET = frozenset(('show', 'session', 'receipt', 'delivery', 'inspect', 'plays'))
-_NUMERIC = frozenset(('show_id', 'session_id', 'report_id', 'tick'))
+_NUMERIC = frozenset(('show_id', 'session_id', 'report_id', 'tick', 'proposal_id'))
+_CORRECTABLE = frozenset(('retract', 'propose', 'authorize'))
 
 
 def _connect(path):
@@ -111,12 +118,97 @@ def _verified_delivery(stores, payload):
     return evidence
 
 
+def _fixed_authorization(stores, session_id, group_id, tick):
+    with _transaction(stores.panels) as db:
+        return read_authorization(db, session_id, group_id, tick)
+
+
+def _receive(stores, payload):
+    evidence = _verified_delivery(stores, payload)
+    # Resolve the target group and read the fixed authorization before taking either
+    # write lock, so a receive never waits on a panel writer while holding the venue.
+    with _transaction(stores.venue) as db:
+        if isinstance(evidence, AuthorizationEvidence):
+            group_id = resolve_group_tick(db, evidence.session_id, evidence.group_id,
+                                          evidence.tick).group.group_id
+        else:
+            group_id = resolve_board_tick(db, evidence.session_id, evidence.board_id,
+                                          evidence.tick).group_id
+    fixed = _fixed_authorization(stores, evidence.session_id, group_id, evidence.tick)
+
+    def lookup(_scope):
+        return fixed
+
+    with _transaction(stores.venue, write=True) as db:
+        if isinstance(evidence, AuthorizationEvidence):
+            return receive_authorized(db, evidence, lookup)
+        confirmation = receive(db, evidence, lookup)
+    if isinstance(evidence, AuthorizationEvidence):
+        return confirmation
+    # If an authorization was fixed while this body was being received, settle against
+    # it now; either arrival order still yields one start with the adopted sources.
+    latest = _fixed_authorization(stores, evidence.session_id, group_id, evidence.tick)
+    if latest is not None and latest != fixed:
+        with _transaction(stores.venue, write=True) as db:
+            settle(db, resolve_group_tick(db, evidence.session_id, group_id, evidence.tick), latest)
+    return confirmation
+
+
+def _correctable_operation(stores, action, payload):
+    if action == 'retract':
+        fields(payload, ('session_id', 'board_id', 'tick', 'press_id', 'request_id'))
+        session_id = integer(payload['session_id'], 'session_id')
+        board_id = text(payload['board_id'], 'board_id')
+        tick = integer(payload['tick'], 'tick')
+        press_id = text(payload['press_id'], 'press_id')
+        request_id = text(payload['request_id'], 'request_id')
+        with _transaction(stores.venue) as db:
+            scope = resolve_board_tick(db, session_id, board_id, tick)
+            mode = read_session(db, session_id).mode
+        with _transaction(stores.panels, write=True) as db:
+            return retract(db, scope, press_id, request_id, mode)
+    if action == 'propose':
+        fields(payload, ('session_id', 'group_id', 'tick', 'request_id', 'rule_id', 'press_ids'))
+        session_id = integer(payload['session_id'], 'session_id')
+        group_id = text(payload['group_id'], 'group_id')
+        tick = integer(payload['tick'], 'tick')
+        request_id = text(payload['request_id'], 'request_id')
+        rule_id = payload['rule_id']
+        if rule_id is not None:
+            rule_id = text(rule_id, 'rule_id')
+        press_ids = payload['press_ids']
+        if not isinstance(press_ids, dict):
+            fail(400, 'invalid_press_ids', 'press_ids must map board identifiers to press identifiers')
+        press_ids = {text(board, 'press_ids'): text(press, 'press_ids')
+                     for board, press in press_ids.items()}
+        with _transaction(stores.venue) as db:
+            scope = resolve_group_tick(db, session_id, group_id, tick)
+        with _transaction(stores.panels, write=True) as db:
+            return propose(db, scope, request_id, rule_id, press_ids)
+    fields(payload, ('session_id', 'group_id', 'tick', 'request_id'), ('proposal_id',))
+    session_id = integer(payload['session_id'], 'session_id')
+    group_id = text(payload['group_id'], 'group_id')
+    tick = integer(payload['tick'], 'tick')
+    request_id = text(payload['request_id'], 'request_id')
+    proposal_id = payload.get('proposal_id')
+    if proposal_id is not None:
+        proposal_id = integer(proposal_id, 'proposal_id')
+    with _transaction(stores.venue) as db:
+        scope = resolve_group_tick(db, session_id, group_id, tick)
+    with _transaction(stores.panels, write=True) as db:
+        return authorize(db, scope, request_id, proposal_id)
+
+
 def _venue_operation(db, action, payload):
     if action == 'issue':
         return issue(db, payload).payload()
     if action == 'open':
-        fields(payload, ('show_id', 'bindings'))
-        return open_session(db, integer(payload['show_id'], 'show_id'), payload['bindings']).payload()
+        fields(payload, ('show_id', 'bindings'), ('mode',))
+        mode = payload.get('mode', 'normal')
+        if not isinstance(mode, str):
+            fail(400, 'invalid_mode', 'Mode must be text')
+        return open_session(db, integer(payload['show_id'], 'show_id'), payload['bindings'],
+                            mode).payload()
     if action == 'show':
         fields(payload, ('show_id',))
         return load_show(db, integer(payload['show_id'], 'show_id')).payload()
@@ -138,7 +230,7 @@ def _venue_operation(db, action, payload):
     session = open_tick(db, session_id, tick)
     show = load_show(db, session.show_id)
     for group in show.draft.groups.values():
-        settle_group_tick(db, GroupTick(session, show, group, tick))
+        settle(db, GroupTick(session, show, group, tick))
     return {'session_id': session_id, 'tick': tick}
 
 
@@ -152,9 +244,9 @@ def handle_request(stores: Stores, action: str, payload):
     if action in ('receipt', 'delivery'):
         return _panel_query(stores, action, payload)
     if action == 'receive':
-        evidence = _verified_delivery(stores, payload)
-        with _transaction(stores.venue, write=True) as db:
-            return receive(db, evidence)
+        return _receive(stores, payload)
+    if action in _CORRECTABLE:
+        return _correctable_operation(stores, action, payload)
     with _transaction(stores.venue, write=action in _POST) as db:
         return _venue_operation(db, action, payload)
 

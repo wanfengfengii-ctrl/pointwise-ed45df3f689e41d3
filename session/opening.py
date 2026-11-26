@@ -13,6 +13,7 @@ class SessionRecord:
     bindings: dict[str, PanelBinding]
     last_tick: int = 0
     closed_tick: int | None = None
+    mode: str = 'normal'
 
     def payload(self):
         return {
@@ -31,17 +32,24 @@ def init_session_schema(db):
             show_id INTEGER NOT NULL REFERENCES shows(show_id),
             bindings TEXT NOT NULL,
             last_tick INTEGER NOT NULL DEFAULT 0 CHECK (last_tick >= 0),
-            closed_tick INTEGER CHECK (closed_tick = last_tick)
+            closed_tick INTEGER CHECK (closed_tick = last_tick),
+            mode TEXT NOT NULL DEFAULT 'normal'
         )
     ''')
+    columns = {row[1] for row in db.execute('PRAGMA table_info(sessions)')}
+    if 'mode' not in columns:
+        db.execute("ALTER TABLE sessions ADD COLUMN mode TEXT NOT NULL DEFAULT 'normal'")
 
 
-def open_session(db, show_id, entries):
+def open_session(db, show_id, entries, mode='normal'):
+    if mode not in ('normal', 'correctable'):
+        fail(400, 'invalid_mode', 'Mode must be normal or correctable')
     show = load_show(db, show_id)
     bindings = verify_bindings(show, entries)
     body = json.dumps([asdict(binding) for binding in bindings.values()])
-    cursor = db.execute('INSERT INTO sessions(show_id, bindings) VALUES (?, ?)', (show_id, body))
-    return SessionRecord(cursor.lastrowid, show.show_id, bindings)
+    cursor = db.execute('INSERT INTO sessions(show_id, bindings, mode) VALUES (?, ?, ?)',
+                        (show_id, body, mode))
+    return SessionRecord(cursor.lastrowid, show.show_id, bindings, mode=mode)
 
 
 def read_session(db, session_id):
@@ -49,4 +57,5 @@ def read_session(db, session_id):
     if row is None:
         fail(404, 'unknown_session', f'Session {session_id} has not been opened')
     bindings = {entry['board_id']: PanelBinding(**entry) for entry in json.loads(row['bindings'])}
-    return SessionRecord(session_id, row['show_id'], bindings, row['last_tick'], row['closed_tick'])
+    return SessionRecord(session_id, row['show_id'], bindings, row['last_tick'],
+                         row['closed_tick'], row['mode'])

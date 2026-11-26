@@ -109,9 +109,12 @@ def gallery_input(*groups):
     return data
 
 
-def open_gallery(client, data):
+def open_gallery(client, data, mode=None):
     show = client.post('issue', **data['show'])
-    return client.post('open', show_id=show['show_id'], bindings=data['bindings'])
+    opened = {'show_id': show['show_id'], 'bindings': data['bindings']}
+    if mode is not None:
+        opened['mode'] = mode
+    return client.post('open', **opened)
 
 
 def panel_operation(client, operation, session_id, board, tick, request):
@@ -127,8 +130,8 @@ class GalleryTest(unittest.TestCase):
     def client(self):
         return self.gallery.client
 
-    def open_gallery(self, *groups):
-        return open_gallery(self.client, gallery_input(*groups))['session_id']
+    def open_gallery(self, *groups, mode=None):
+        return open_gallery(self.client, gallery_input(*groups), mode=mode)['session_id']
 
     def rejected(self, code, action, *, method='post', status=409, **payload):
         with self.assertRaises(RejectedRequest) as caught:
